@@ -154,7 +154,7 @@ def cmd_embed():
             ca_terms = pickle.load(f)
         print(f"\n✓ Loaded {len(ca_terms)} Citizens Advice terms for tagging")
     except FileNotFoundError:
-        print(f"\n⚠️  CA terms file not found at {CA_TERMS_PATH}")
+        print(f"\n  CA terms file not found at {CA_TERMS_PATH}")
         print("    Continuing without tagging.")
         ca_terms = []
     
@@ -163,7 +163,7 @@ def cmd_embed():
     print(f"✓ Found {len(xml_files)} XML file(s) in {XML_DIR}")
     
     if not xml_files:
-        print(f"\n❌ No .xml files found in {XML_DIR}")
+        print(f"\n No .xml files found in {XML_DIR}")
         print("   Make sure your XML files are in the correct directory.")
         sys.exit(1)
     
@@ -246,29 +246,13 @@ def cmd_embed():
             })
     
     # Save vectors
-    print(f"\n⏳ Saving {len(all_vectors)} vectors to {VECTORS_PATH}...")
+    print(f"\n Saving {len(all_vectors)} vectors to {VECTORS_PATH}...")
     with open(VECTORS_PATH, "wb") as f:
         pickle.dump(all_vectors, f)
     
     print(f"✓ Saved {len(all_vectors)} vectors")
     
-    # Print statistics
-    print(f"\n{'='*80}")
-    print("📊 EMBEDDING STATISTICS:")
-    print("="*80)
-    print(f"  Total cases processed: {tag_stats['total_cases']}")
-    print(f"  Total paragraphs: {tag_stats['total_paragraphs']:,}")
-    print(f"  Total vectors created: {len(all_vectors):,}")
-    
-    if ca_terms:
-        print(f"\n📊 TAGGING STATISTICS (Case-Level):")
-        print(f"  Cases tagged: {tag_stats['tagged_cases']}/{tag_stats['total_cases']} "
-              f"({100*tag_stats['tagged_cases']/tag_stats['total_cases']:.1f}%)")
-        print(f"  Total tags applied: {tag_stats['total_tags']}")
-        if tag_stats['tagged_cases'] > 0:
-            print(f"  Average tags per case: {tag_stats['total_tags']/tag_stats['tagged_cases']:.1f}")
-    
-    print(f"\n✅ Embedding complete! Vectors saved to {VECTORS_PATH}")
+    print(f"\n Embedding complete! Vectors saved to {VECTORS_PATH}")
     print("="*80)
 
 
@@ -285,7 +269,7 @@ def cmd_upsert():
     # Check for API key
     api_key = os.environ.get("PINECONE_API_KEY")
     if not api_key:
-        print("\n❌ PINECONE_API_KEY environment variable not set")
+        print("\n PINECONE_API_KEY environment variable not set")
         print("   Set it with: export PINECONE_API_KEY='your-key-here'")
         sys.exit(1)
     
@@ -294,14 +278,14 @@ def cmd_upsert():
     try:
         with open(VECTORS_PATH, "rb") as f:
             all_vectors = pickle.load(f)
-        print(f"✓ Loaded {len(all_vectors):,} vectors")
+        print(f" Loaded {len(all_vectors):,} vectors")
     except FileNotFoundError:
-        print(f"\n❌ Vectors file not found: {VECTORS_PATH}")
+        print(f"\n Vectors file not found: {VECTORS_PATH}")
         print("   Run 'python caselaw_pinecone_search.py embed' first")
         sys.exit(1)
     
     # Connect to Pinecone
-    print(f"\n⏳ Connecting to Pinecone index '{PINECONE_INDEX_NAME}'...")
+    print(f"\n Connecting to Pinecone index '{PINECONE_INDEX_NAME}'...")
     pc = Pinecone(api_key=api_key)
     index = pc.Index(PINECONE_INDEX_NAME)
     print("✓ Connected")
@@ -319,7 +303,7 @@ def cmd_upsert():
         if (i // batch_size + 1) % 10 == 0:
             print(f"  Progress: {i + len(batch)}/{len(all_vectors)} vectors uploaded...")
     
-    print(f"\n✅ Upload complete! {len(all_vectors):,} vectors now in Pinecone")
+    print(f"\n Upload complete! {len(all_vectors):,} vectors now in Pinecone")
     print("="*80)
 
 
@@ -332,7 +316,7 @@ def cmd_search():
     print("="*80)
     print("STEP 3: LAUNCHING SEARCH INTERFACE")
     print("="*80)
-    print("\n⏳ Starting Streamlit app...")
+    print("\n Starting Streamlit app...")
     print("   The search interface will open in your browser automatically.")
     print("   Press Ctrl+C to stop the server.\n")
     
