@@ -10,12 +10,8 @@ embeddings, and each case is tagged with plain-English legal concepts drawn
 from Citizens Advice, so that results can be understood by non-lawyers.
 
 > **This is the BETA prototype**, the second iteration in the project, intended
-> for deployment at **research.caselaw.gov.uk/beta**. It builds on the earlier
-> ALPHA prototype (deployed at **research.caselaw.gov.uk/alpha**), which used
-> Word2Vec embeddings with comparison against the British National Corpus. Beta
-> moves to Sentence-BERT (`all-MiniLM-L6-v2`) embeddings, a vector database, and
-> a Citizens Advice concept-tagging layer. The two prototypes are maintained as
-> separate repositories with separate deployment targets.
+> for deployment. It builds on the earlier
+> ALPHA prototype (deployed at **(https://research.caselaw.nationalarchives.gov.uk)**), and found on case-law-semantic-alpha repo. 
 
 > **Status:** research prototype. Currently uses Pinecone for vector storage;
 > migration to AWS S3 Vectors is in progress (see *Deployment notes* below).
@@ -38,25 +34,6 @@ python caselaw_pinecone_search.py embed     # parse + embed + tag
 python caselaw_pinecone_search.py upsert    # upload vectors to the index
 streamlit run caselaw_pinecone_search.py    # launch the search UI
 ```
-
-### Key design decisions
-
-- **Paragraph-level search, case-level tagging.** Each paragraph is embedded
-  separately for fine-grained retrieval, but Citizens Advice tags are applied
-  at the whole-case level (based on a sample of the opening paragraphs) so that
-  results describe what the *case* is about rather than a single paragraph.
-- **Dual embedding strategy.** For *tagging*, a clean sample of the judgment is
-  embedded without metadata context, to match cleanly against CA concept
-  definitions. For *search*, paragraphs are embedded with a metadata context
-  prefix (court, judge, date, case name) to support richer queries.
-- **Tagging by semantic similarity.** Each Citizens Advice concept is
-  represented by the embedding of its plain-English *definition*. A case is
-  tagged with a concept when cosine similarity exceeds a threshold; the top
-  matching tags are retained. The threshold and tag cap are tunable parameters.
-- **Case aggregation in results.** The search retrieves many matching
-  paragraphs, then aggregates them by case and ranks cases by average
-  similarity, so a single case does not appear multiple times.
-
 ---
 
 ## Requirements
@@ -109,31 +86,6 @@ to this repository (see `.gitignore`).
 - ~339,725 paragraph-level vectors (384-dim, `all-MiniLM-L6-v2`)
 - Case-level Citizens Advice tagging across ~109 curated concepts
 - Tagging threshold and per-case tag cap are configurable
-
----
-
-## Deployment notes (for review)
-
-This prototype currently uses **Pinecone** as the vector store. The intended
-production direction is to migrate vector storage to **AWS S3 Vectors** within
-TNA's AWS environment.
-
-Points relevant to migration:
-
-- **The embeddings are portable and model-agnostic** — 384-dimensional float
-  vectors with cosine similarity. Nothing about them is tied to Pinecone;
-  migrating means re-importing the same vectors into a different store.
-- Only two parts of the code are storage-specific and would change: the
-  `upsert` step and the query call in the search UI. The parse / embed / tag
-  pipeline is unchanged.
-- The embedding model (`all-MiniLM-L6-v2`) is small (~90MB) and runs on CPU.
-  Note it currently downloads from Hugging Face on first run, which may need to
-  be vendored/bundled in a restricted environment.
-- Authentication is currently via an environment-variable API key. In AWS this
-  is expected to move to IAM-role-based access rather than long-lived keys.
-
-Streamlit is used here as a prototyping interface only; a production front end
-would be a separate build.
 
 ---
 
