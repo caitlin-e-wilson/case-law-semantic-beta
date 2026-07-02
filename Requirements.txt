@@ -1,0 +1,17 @@
+# Python 3.13
+#
+# Core dependencies for the Lost for Words semantic search prototype.
+# Versions reflect the development environment; the engineer may wish to
+# re-pin these for the target deployment environment.
+
+sentence-transformers>=5.0
+scikit-learn>=1.7
+streamlit>=1.50
+numpy>=2.0
+
+# Vector store (current). To be replaced by AWS S3 Vectors via boto3
+# during migration to TNA's AWS environment.
+pinecone>=6.0
+
+# Required once migrating to AWS S3 Vectors:
+# boto3>=1.34

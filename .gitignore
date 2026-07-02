@@ -1,0 +1,42 @@
+# ---- Secrets / credentials (NEVER commit) ----
+.env
+.env.*
+*.pem
+*.key
+credentials
+aws.json
+secrets.toml
+.streamlit/secrets.toml
+
+# ---- Embedded vectors & data artifacts (large / regenerable) ----
+*.pkl
+*.faiss
+*.index
+
+# ---- Judgment corpus (not for version control) ----
+caselaw_fam_xml/
+*.xml
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+myenv/
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ---- Streamlit ----
+.streamlit/
