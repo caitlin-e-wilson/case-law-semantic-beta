@@ -26,15 +26,15 @@ import streamlit as st
 # CONFIGURATION
 # ============================================================================
 
-XML_DIR = "."
-VECTORS_PATH = "./test_vectors.pkl"
+XML_DIR = "./caselaw_xml"
+VECTORS_PATH = "./caselaw_vectors_2026.pkl"
 CA_TERMS_PATH = "./ca_terms_all.pkl"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
 # S3 Vectors configuration
 AWS_REGION = "eu-west-2"
 S3_VECTOR_BUCKET_NAME = "caselaw-semantic-shift-beta"
-S3_VECTOR_INDEX_NAME = "caselaw-semantic-beta-fam"  # swap this to the full-catalogue
+S3_VECTOR_INDEX_NAME = "caselaw-semantic-beta-all"  # swap this to the full-catalogue
                                                       # index name when ready to launch
 
 # S3 Vectors query_vectors currently caps top_k at 30 per call, with no pagination.
