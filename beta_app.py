@@ -2,12 +2,12 @@
 """
 FCL Semantic Search Prototype BETA - Family Law
 
-A semantic search system for EWFC with Citizens Advice tagging
+A semantic search system for UK Family Division case law with Citizens Advice tagging
 
 Requirements:
     - XML files in ./caselaw_fam_xml/
     - ca_terms_all.pkl in current directory
-    - Pinecone API key in environment variable PINECONE_API_KEY
+    - AWS credentials configured (AWS SSO) with access to the S3 Vectors bucket
 """
 
 import sys
@@ -19,18 +19,26 @@ from typing import List, Dict, Optional, Tuple
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
-from pinecone import Pinecone
+import boto3
 import streamlit as st
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
-XML_DIR = "./caselaw_fam_xml"
-VECTORS_PATH = "./caselaw_fam_vectors.pkl"
+XML_DIR = "."
+VECTORS_PATH = "./test_vectors.pkl"
 CA_TERMS_PATH = "./ca_terms_all.pkl"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
-PINECONE_INDEX_NAME = "caselaw-beta2"
+
+# S3 Vectors configuration
+AWS_REGION = "eu-west-2"
+S3_VECTOR_BUCKET_NAME = "caselaw-semantic-shift-beta"
+S3_VECTOR_INDEX_NAME = "caselaw-semantic-beta-fam"  # swap this to the full-catalogue
+                                                      # index name when ready to launch
+
+# S3 Vectors query_vectors currently caps top_k at 30 per call, with no pagination.
+S3_VECTORS_MAX_TOPK = 30
 
 # Akoma Ntoso XML namespaces
 NS = {
@@ -132,7 +140,7 @@ def tag_judgment(judgment_embedding: np.ndarray, ca_terms: List[Dict], threshold
     # Sort by similarity (highest first)
     tags.sort(key=lambda x: x['similarity'], reverse=True)
 
-    # Keep only top 4 tags
+    # Keep only top 3 tags
     top_tags = tags[:4]
 
     return [tag['term'] for tag in top_tags]
@@ -154,7 +162,7 @@ def cmd_embed():
             ca_terms = pickle.load(f)
         print(f"\n✓ Loaded {len(ca_terms)} Citizens Advice terms for tagging")
     except FileNotFoundError:
-        print(f"\n  CA terms file not found at {CA_TERMS_PATH}")
+        print(f"\n⚠️  CA terms file not found at {CA_TERMS_PATH}")
         print("    Continuing without tagging.")
         ca_terms = []
     
@@ -163,7 +171,7 @@ def cmd_embed():
     print(f"✓ Found {len(xml_files)} XML file(s) in {XML_DIR}")
     
     if not xml_files:
-        print(f"\n No .xml files found in {XML_DIR}")
+        print(f"\n❌ No .xml files found in {XML_DIR}")
         print("   Make sure your XML files are in the correct directory.")
         sys.exit(1)
     
@@ -246,13 +254,29 @@ def cmd_embed():
             })
     
     # Save vectors
-    print(f"\n Saving {len(all_vectors)} vectors to {VECTORS_PATH}...")
+    print(f"\n⏳ Saving {len(all_vectors)} vectors to {VECTORS_PATH}...")
     with open(VECTORS_PATH, "wb") as f:
         pickle.dump(all_vectors, f)
     
     print(f"✓ Saved {len(all_vectors)} vectors")
     
-    print(f"\n Embedding complete! Vectors saved to {VECTORS_PATH}")
+    # Print statistics
+    print(f"\n{'='*80}")
+    print("📊 EMBEDDING STATISTICS:")
+    print("="*80)
+    print(f"  Total cases processed: {tag_stats['total_cases']}")
+    print(f"  Total paragraphs: {tag_stats['total_paragraphs']:,}")
+    print(f"  Total vectors created: {len(all_vectors):,}")
+    
+    if ca_terms:
+        print(f"\n📊 TAGGING STATISTICS (Case-Level):")
+        print(f"  Cases tagged: {tag_stats['tagged_cases']}/{tag_stats['total_cases']} "
+              f"({100*tag_stats['tagged_cases']/tag_stats['total_cases']:.1f}%)")
+        print(f"  Total tags applied: {tag_stats['total_tags']}")
+        if tag_stats['tagged_cases'] > 0:
+            print(f"  Average tags per case: {tag_stats['total_tags']/tag_stats['tagged_cases']:.1f}")
+    
+    print(f"\n✅ Embedding complete! Vectors saved to {VECTORS_PATH}")
     print("="*80)
 
 
@@ -261,49 +285,61 @@ def cmd_embed():
 # ============================================================================
 
 def cmd_upsert():
-    """Upload vectors to Pinecone."""
+    """Upload vectors to S3 Vectors."""
     print("="*80)
-    print("STEP 2: UPLOADING TO PINECONE")
+    print("STEP 2: UPLOADING TO S3 VECTORS")
     print("="*80)
-    
-    # Check for API key
-    api_key = os.environ.get("PINECONE_API_KEY")
-    if not api_key:
-        print("\n PINECONE_API_KEY environment variable not set")
-        print("   Set it with: export PINECONE_API_KEY='your-key-here'")
-        sys.exit(1)
-    
+
     # Load vectors
     print(f"\n⏳ Loading vectors from {VECTORS_PATH}...")
     try:
         with open(VECTORS_PATH, "rb") as f:
             all_vectors = pickle.load(f)
-        print(f" Loaded {len(all_vectors):,} vectors")
+        print(f"✓ Loaded {len(all_vectors):,} vectors")
     except FileNotFoundError:
-        print(f"\n Vectors file not found: {VECTORS_PATH}")
-        print("   Run 'python caselaw_pinecone_search.py embed' first")
+        print(f"\n❌ Vectors file not found: {VECTORS_PATH}")
+        print("   Run 'python beta_app.py embed' first")
         sys.exit(1)
-    
-    # Connect to Pinecone
-    print(f"\n Connecting to Pinecone index '{PINECONE_INDEX_NAME}'...")
-    pc = Pinecone(api_key=api_key)
-    index = pc.Index(PINECONE_INDEX_NAME)
+
+    # Connect to S3 Vectors (uses AWS SSO / default credential chain — no keys in code)
+    print(f"\n⏳ Connecting to S3 Vectors bucket '{S3_VECTOR_BUCKET_NAME}', "
+          f"index '{S3_VECTOR_INDEX_NAME}'...")
+    s3vectors = boto3.client("s3vectors", region_name=AWS_REGION)
     print("✓ Connected")
-    
-    # Upsert in batches
-    batch_size = 100
+
+    # Translate Pinecone-shaped vectors {id, values, metadata} into
+    # S3 Vectors shape {key, data: {float32: [...]}, metadata}.
+    # S3 Vectors rejects empty arrays in metadata (Pinecone allowed them), so
+    # we drop the 'tags' key entirely when there are no tags, rather than
+    # sending an empty list.
+    def to_s3_vector(v):
+        metadata = dict(v["metadata"])  # shallow copy so we don't mutate the original
+        if not metadata.get("tags"):
+            metadata.pop("tags", None)
+        return {
+            "key": v["id"],
+            "data": {"float32": v["values"]},
+            "metadata": metadata,
+        }
+
+    # S3 Vectors put_vectors accepts up to 500 vectors per call
+    batch_size = 500
     total_batches = (len(all_vectors) + batch_size - 1) // batch_size
-    
+
     print(f"\n⏳ Upserting {len(all_vectors):,} vectors in {total_batches} batches...")
-    
+
     for i in range(0, len(all_vectors), batch_size):
-        batch = all_vectors[i:i + batch_size]
-        index.upsert(vectors=batch)
-        
+        batch = [to_s3_vector(v) for v in all_vectors[i:i + batch_size]]
+        s3vectors.put_vectors(
+            vectorBucketName=S3_VECTOR_BUCKET_NAME,
+            indexName=S3_VECTOR_INDEX_NAME,
+            vectors=batch,
+        )
+
         if (i // batch_size + 1) % 10 == 0:
             print(f"  Progress: {i + len(batch)}/{len(all_vectors)} vectors uploaded...")
-    
-    print(f"\n Upload complete! {len(all_vectors):,} vectors now in Pinecone")
+
+    print(f"\n✅ Upload complete! {len(all_vectors):,} vectors now in S3 Vectors")
     print("="*80)
 
 
@@ -316,7 +352,7 @@ def cmd_search():
     print("="*80)
     print("STEP 3: LAUNCHING SEARCH INTERFACE")
     print("="*80)
-    print("\n Starting Streamlit app...")
+    print("\n⏳ Starting Streamlit app...")
     print("   The search interface will open in your browser automatically.")
     print("   Press Ctrl+C to stop the server.\n")
     
@@ -325,7 +361,7 @@ def cmd_search():
 
 
 # ============================================================================
-# STREAMLIT UI 
+# STREAMLIT UI (runs when called via streamlit run)
 # ============================================================================
 
 def build_pinecone_filter(court: str, judge: str, year_from: int, year_to: int, citation: str) -> Optional[Dict]:
@@ -409,44 +445,59 @@ def streamlit_ui():
             return {}
     
     @st.cache_resource
-    def connect_pinecone():
-        api_key = os.environ.get("PINECONE_API_KEY")
-        if not api_key:
-            st.error("PINECONE_API_KEY environment variable not set")
-            st.stop()
-        pc = Pinecone(api_key=api_key)
-        return pc.Index(PINECONE_INDEX_NAME)
+    def connect_s3vectors():
+        return boto3.client("s3vectors", region_name=AWS_REGION)
     
     model = load_model()
     ca_lookup = load_ca_terms()
-    index = connect_pinecone()
+    s3vectors = connect_s3vectors()
     
     # Search input
     st.markdown("---")
     
     query = st.text_input("🔍 Search", placeholder="e.g., parental responsibility dispute", label_visibility="collapsed")
 
-    # Set fixed number of results to fetch
-    top_k = 100  # Fetch 100 results, show 10 at a time with pagination 
-    
+    # Set fixed number of results to fetch.
+    # NOTE: S3 Vectors currently caps top_k at 30 per query with no pagination,
+    # vs. the 100 we could pull from Pinecone. This means case aggregation below
+    # draws from fewer candidate paragraphs than before — acceptable for this
+    # proof-of-concept scale, but worth knowing if result quality shifts.
+    top_k = 10  # number of CASES to display (unchanged)
+    query_top_k = S3_VECTORS_MAX_TOPK  # number of raw paragraph matches to fetch (max 30)
+
     # Search on enter or button click
     if query:
         with st.spinner("Searching..."):
             # Encode query
             query_vector = model.encode(query, show_progress_bar=False).tolist()
-            
-            # Search Pinecone (get many paragraphs to aggregate by case)
-            results = index.query(
-                vector=query_vector,
-                top_k=100,  # Get many paragraphs, will aggregate to top_k cases
-                include_metadata=True
+
+            # Search S3 Vectors (get as many paragraphs as allowed, to aggregate by case)
+            response = s3vectors.query_vectors(
+                vectorBucketName=S3_VECTOR_BUCKET_NAME,
+                indexName=S3_VECTOR_INDEX_NAME,
+                queryVector={"float32": query_vector},
+                topK=query_top_k,
+                returnMetadata=True,
+                returnDistance=True,
             )
-            
+
+            # Translate S3 Vectors response shape into the {score, metadata} shape
+            # the rest of the app expects. For cosine distance, similarity = 1 - distance
+            # (S3 Vectors returns distance; Pinecone returned similarity score directly).
+            raw_matches = []
+            for v in response.get("vectors", []):
+                distance = v.get("distance", 0.0)
+                similarity = 1 - distance
+                raw_matches.append({
+                    "score": similarity,
+                    "metadata": v.get("metadata", {}),
+                })
+
             # Aggregate scores by case (Option 3)
             from collections import defaultdict
             case_scores = defaultdict(list)
-            
-            for match in results.get("matches", []):
+
+            for match in raw_matches:
                 case_id = match["metadata"].get("doc_id")
                 case_scores[case_id].append({
                     'score': match['score'],
@@ -548,16 +599,16 @@ def streamlit_ui():
     
     # Footer
     st.markdown("---")
-    st.markdown("""
+    st.markdown("""""
                 **About:** Semantic search powered by sentence transformers. Legal concept tags from [Citizens Advice](https://www.citizensadvice.org.uk/family/). 
-                This is a prototype semantic search engine that uses vector embeddings to match search queries to case law judgments. 
-                Vectors were created at the paragraph level, the paragraph with the closest semantic match to the search query is shown in the preview. 
+                This is a prototype semantic search engine that uses vector embeddings to math search queries to case law judgments. 
+                Vectors were created at the paragraph level, the paragraph witht eh closest semantic match to the search query is shown in the preview. 
                 Clicking on a  suggested case takes you to the judgement on the [Find Case Law](https://caselaw.nationalarchives.gov.uk/) website.
                 This tool is intended for research and prototyping purposes only.
-                This is an beta version developed by Caitlin Wilson as part of a collaborative PhD project between King's College London and The National Archives, funded by the London Arts and Humanities Partnership.
-                Supervisors: Dr Barbara McGillivray and Dr Niccolò Ridi.
+                This is an alpha version developed by Caitlin Wilson as part of a collaborative PhD project between King's College London and The National Archives, funded by the London Arts and Humanities Partnership.
+                Supervisors: Dr Barbara McGillivray and Dr Niccolo Ridi.
                 With generous support from the Find Case Law team at The National Archives.
-                """) 
+                """"") 
 
 # ============================================================================
 # MAIN ENTRY POINT
