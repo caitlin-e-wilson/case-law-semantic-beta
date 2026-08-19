@@ -12,6 +12,7 @@ Requirements:
 
 import sys
 import os
+import re
 import pickle
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -20,6 +21,7 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
 import boto3
+from botocore.exceptions import ClientError
 import streamlit as st
 
 # ============================================================================
@@ -28,14 +30,13 @@ import streamlit as st
 
 XML_DIR = "./caselaw_xml"
 VECTORS_PATH = "./caselaw_vectors_2026.pkl"
-CA_TERMS_PATH = "./ca_terms_all.pkl"
+CA_TERMS_PATH = "./beta-app-folder/ca_terms_all.pkl"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
 # S3 Vectors configuration
 AWS_REGION = "eu-west-2"
 S3_VECTOR_BUCKET_NAME = "caselaw-semantic-shift-beta"
-S3_VECTOR_INDEX_NAME = "caselaw-semantic-beta-all"  # swap this to the full-catalogue
-                                                      # index name when ready to launch
+S3_VECTOR_INDEX_NAME = "caselaw-semantic-beta-all" 
 
 # S3 Vectors query_vectors currently caps top_k at 30 per call, with no pagination.
 S3_VECTORS_MAX_TOPK = 30
@@ -285,7 +286,9 @@ def cmd_embed():
 # ============================================================================
 
 def cmd_upsert():
-    """Upload vectors to S3 Vectors."""
+    """Upload vectors to S3 Vectors. Resumable: if interrupted (e.g. SSO
+    session expiry on a long run), re-running this command picks up from the
+    last completed batch rather than starting over."""
     print("="*80)
     print("STEP 2: UPLOADING TO S3 VECTORS")
     print("="*80)
@@ -301,21 +304,38 @@ def cmd_upsert():
         print("   Run 'python beta_app.py embed' first")
         sys.exit(1)
 
+    # Checkpoint file — one per vectors file + index combo, so switching
+    # corpora or indexes doesn't collide with an unrelated checkpoint.
+    checkpoint_path = Path(f"{VECTORS_PATH}.{S3_VECTOR_INDEX_NAME}.upsert_checkpoint")
+    start_batch = 0
+    if checkpoint_path.exists():
+        try:
+            start_batch = int(checkpoint_path.read_text().strip())
+            print(f"\n↻ Found checkpoint — resuming from batch {start_batch}")
+        except ValueError:
+            print(f"\n⚠️  Could not read checkpoint file, starting from the beginning")
+            start_batch = 0
+
     # Connect to S3 Vectors (uses AWS SSO / default credential chain — no keys in code)
     print(f"\n⏳ Connecting to S3 Vectors bucket '{S3_VECTOR_BUCKET_NAME}', "
           f"index '{S3_VECTOR_INDEX_NAME}'...")
     s3vectors = boto3.client("s3vectors", region_name=AWS_REGION)
     print("✓ Connected")
 
-    # Translate Pinecone-shaped vectors {id, values, metadata} into
-    # S3 Vectors shape {key, data: {float32: [...]}, metadata}.
-    # S3 Vectors rejects empty arrays in metadata (Pinecone allowed them), so
-    # we drop the 'tags' key entirely when there are no tags, rather than
-    # sending an empty list.
+    TEXT_BYTE_LIMIT = 1400  # issue encountered during upsert, leaves ~650 bytes headroom for all other fields combined 
+
+    def safe_truncate_bytes(s: str, max_bytes: int) -> str:
+        encoded = s.encode("utf-8")
+        if len(encoded) <= max_bytes:
+            return s
+        return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
     def to_s3_vector(v):
         metadata = dict(v["metadata"])  # shallow copy so we don't mutate the original
         if not metadata.get("tags"):
             metadata.pop("tags", None)
+        if "text" in metadata and isinstance(metadata["text"], str):
+            metadata["text"] = safe_truncate_bytes(metadata["text"], TEXT_BYTE_LIMIT)
         return {
             "key": v["id"],
             "data": {"float32": v["values"]},
@@ -326,20 +346,84 @@ def cmd_upsert():
     batch_size = 500
     total_batches = (len(all_vectors) + batch_size - 1) // batch_size
 
-    print(f"\n⏳ Upserting {len(all_vectors):,} vectors in {total_batches} batches...")
+    # Log of any individual records that had to be skipped (e.g. still too
+    # large after truncation, or some other per-record validation issue) so
+    # nothing silently vanishes from the corpus without a record of it.
+    skip_log_path = Path(f"{VECTORS_PATH}.{S3_VECTOR_INDEX_NAME}.skipped_vectors.txt")
+    skipped_count = 0
 
-    for i in range(0, len(all_vectors), batch_size):
-        batch = [to_s3_vector(v) for v in all_vectors[i:i + batch_size]]
-        s3vectors.put_vectors(
-            vectorBucketName=S3_VECTOR_BUCKET_NAME,
-            indexName=S3_VECTOR_INDEX_NAME,
-            vectors=batch,
-        )
+    print(f"\n⏳ Upserting {len(all_vectors):,} vectors in {total_batches} batches "
+          f"(starting at batch {start_batch})...")
 
-        if (i // batch_size + 1) % 10 == 0:
-            print(f"  Progress: {i + len(batch)}/{len(all_vectors)} vectors uploaded...")
+    batch_num = 0
+    try:
+        for i in range(0, len(all_vectors), batch_size):
+            if batch_num < start_batch:
+                batch_num += 1
+                continue  # already uploaded in a previous run
 
-    print(f"\n✅ Upload complete! {len(all_vectors):,} vectors now in S3 Vectors")
+            batch = [to_s3_vector(v) for v in all_vectors[i:i + batch_size]]
+
+            # Attempt the batch; if AWS rejects one specific record (e.g. a
+            # validation error naming a single key), remove just that record
+            # and retry the rest of the batch, rather than losing the whole
+            # batch or stopping the run. Capped at a sane number of retries
+            # per batch as a safety net against an unexpected repeating error.
+            for attempt in range(20):
+                if not batch:
+                    break  # everything in this batch got skipped
+                try:
+                    s3vectors.put_vectors(
+                        vectorBucketName=S3_VECTOR_BUCKET_NAME,
+                        indexName=S3_VECTOR_INDEX_NAME,
+                        vectors=batch,
+                    )
+                    break  # success
+                except ClientError as e:
+                    error_code = e.response.get("Error", {}).get("Code", "")
+                    error_message = e.response.get("Error", {}).get("Message", "")
+                    match = re.search(r"Invalid record for key '([^']+)'", error_message)
+                    if error_code == "ValidationException" and match:
+                        bad_key = match.group(1)
+                        batch = [b for b in batch if b["key"] != bad_key]
+                        skipped_count += 1
+                        with open(skip_log_path, "a") as logf:
+                            logf.write(f"{bad_key}\t{error_message}\n")
+                        continue  # retry the batch without the bad record
+                    raise  # some other error — let the outer handler deal with it
+            else:
+                raise RuntimeError(
+                    f"Batch {batch_num} still failing after 20 skip attempts — "
+                    f"stopping rather than looping indefinitely."
+                )
+
+            batch_num += 1
+            # Save progress after every successful batch, so an interruption
+            # at any point can resume from here rather than the start.
+            checkpoint_path.write_text(str(batch_num))
+
+            if batch_num % 10 == 0:
+                print(f"  Progress: {min(i + batch_size, len(all_vectors))}/{len(all_vectors)} "
+                      f"vectors uploaded (batch {batch_num}/{total_batches}, "
+                      f"{skipped_count} skipped so far)...")
+
+    except Exception as e:
+        print(f"\n❌ Upload interrupted at batch {batch_num}/{total_batches}: {e}")
+        print(f"   Progress saved. Re-run 'python beta_app.py upsert' to resume "
+              f"from batch {batch_num}.")
+        print(f"   (If this was an SSO token error, run 'aws sso login --profile "
+              f"<your-profile>' first.)")
+        sys.exit(1)
+
+    # All batches completed — remove the checkpoint so a future fresh run
+    # (e.g. re-embedding and re-uploading later) starts clean.
+    if checkpoint_path.exists():
+        checkpoint_path.unlink()
+
+    print(f"\n✅ Upload complete! {len(all_vectors) - skipped_count:,} vectors now in S3 Vectors")
+    if skipped_count:
+        print(f"   ⚠️  {skipped_count} record(s) were skipped (individually rejected by "
+              f"S3 Vectors even after truncation). See {skip_log_path} for details.")
     print("="*80)
 
 
@@ -419,10 +503,10 @@ def render_ca_tags(tag_names: List[str], ca_lookup: Dict) -> str:
 
 def streamlit_ui():
     """Main Streamlit search interface."""
-    st.set_page_config(page_title="Lost for Words BETA: family law case search", page_icon="⚖️", layout="wide")
+    st.set_page_config(page_title="Lost for Words BETA: case law case search", page_icon="⚖️", layout="wide")
     
     st.title("⚖️ Lost for Words BETA: family law case search")
-    st.markdown("Semantic search prototype for Family Division judgments (England and Wales) with plain English legal concept tags from Citizens Advice")
+    st.markdown("Semantic search prototype for Find Case Law with plain English legal concept tags from Citizens Advice")
     
     # Load resources
     @st.cache_resource
@@ -458,11 +542,7 @@ def streamlit_ui():
     query = st.text_input("🔍 Search", placeholder="e.g., parental responsibility dispute", label_visibility="collapsed")
 
     # Set fixed number of results to fetch.
-    # NOTE: S3 Vectors currently caps top_k at 30 per query with no pagination,
-    # vs. the 100 we could pull from Pinecone. This means case aggregation below
-    # draws from fewer candidate paragraphs than before — acceptable for this
-    # proof-of-concept scale, but worth knowing if result quality shifts.
-    top_k = 10  # number of CASES to display (unchanged)
+    top_k = 20  # number of CASES to display 
     query_top_k = S3_VECTORS_MAX_TOPK  # number of raw paragraph matches to fetch (max 30)
 
     # Search on enter or button click
@@ -601,8 +681,8 @@ def streamlit_ui():
     st.markdown("---")
     st.markdown("""""
                 **About:** Semantic search powered by sentence transformers. Legal concept tags from [Citizens Advice](https://www.citizensadvice.org.uk/family/). 
-                This is a prototype semantic search engine that uses vector embeddings to math search queries to case law judgments. 
-                Vectors were created at the paragraph level, the paragraph witht eh closest semantic match to the search query is shown in the preview. 
+                This is a prototype semantic search engine that uses vector embeddings to match search queries to case law judgments. 
+                Vectors were created at the paragraph level, the paragraph with theclosest semantic match to the search query is shown in the preview. 
                 Clicking on a  suggested case takes you to the judgement on the [Find Case Law](https://caselaw.nationalarchives.gov.uk/) website.
                 This tool is intended for research and prototyping purposes only.
                 This is an alpha version developed by Caitlin Wilson as part of a collaborative PhD project between King's College London and The National Archives, funded by the London Arts and Humanities Partnership.
